@@ -20,6 +20,7 @@ use napi_derive::napi;
 
 pub mod attachment;
 pub mod backup;
+pub mod device;
 pub mod encryption;
 mod errors;
 pub mod events;
@@ -32,6 +33,7 @@ pub mod sync_events;
 #[cfg(feature = "tracing")]
 pub mod tracing;
 pub mod types;
+pub mod verification;
 pub mod vodozemac;
 
 /// Object containing the versions of the Rust libraries we are using.

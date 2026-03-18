@@ -7,10 +7,13 @@ use std::{
     sync::Arc,
 };
 
-use matrix_sdk_common::ruma::{serde::Raw, OneTimeKeyAlgorithm, OwnedTransactionId, UInt};
+use matrix_sdk_common::ruma::{
+    events::AnyMessageLikeEvent, serde::Raw, OneTimeKeyAlgorithm, OwnedTransactionId, UInt,
+};
 use matrix_sdk_crypto::{
-    backups::MegolmV1BackupKey, types::RoomKeyBackupInfo, DecryptionSettings,
-    EncryptionSyncChanges, TrustRequirement,
+    backups::MegolmV1BackupKey, olm::ExportedRoomKey, store::CrossSigningKeyExport,
+    types::RoomKeyBackupInfo, DecryptionSettings, EncryptionSyncChanges, TrustRequirement,
+    Verification as InnerVerification,
 };
 use napi::bindgen_prelude::{within_runtime_if_available, Either6};
 use napi_derive::*;
@@ -19,12 +22,56 @@ use zeroize::Zeroize;
 
 use crate::{
     backup::{BackupDecryptionKey, BackupKeys, RoomKeyCounts},
-    encryption, identifiers, into_err, olm, requests, responses,
+    device, encryption, identifiers, into_err, olm, requests, responses,
     responses::response_from_string,
     sync_events,
     types::{self, SignatureVerification},
-    vodozemac,
+    verification, vodozemac,
 };
+
+/// Result of `receiveSyncChanges`.
+#[napi(object)]
+pub struct ReceiveSyncChangesResult {
+    /// JSON-encoded array of decrypted to-device events.
+    pub events: String,
+    /// Information about room keys that were part of the sync.
+    pub room_key_infos: Vec<RoomKeyInfoResult>,
+}
+
+/// Information on a room key that was received or updated.
+#[napi(object)]
+pub struct RoomKeyInfoResult {
+    /// The encryption algorithm (e.g. `m.megolm.v1.aes-sha2`).
+    pub algorithm: String,
+    /// The room ID this key is for.
+    pub room_id: String,
+    /// The Curve25519 key of the sender, base64-encoded.
+    pub sender_key: String,
+    /// The session ID.
+    pub session_id: String,
+}
+
+/// Result of importing room keys.
+#[napi(object)]
+pub struct ImportRoomKeysResult {
+    /// The number of room keys that were imported.
+    pub imported_count: f64,
+    /// The total number of room keys in the export.
+    pub total_count: f64,
+    /// JSON-encoded map of room_id -> sender_key -> [session_ids].
+    pub keys: String,
+}
+
+/// Exported private cross-signing keys.
+#[napi(object)]
+pub struct CrossSigningKeyExportResult {
+    /// The master key, if available.
+    pub master_key: Option<String>,
+    /// The self-signing key, if available.
+    pub self_signing_key: Option<String>,
+    /// The user-signing key, if available.
+    pub user_signing_key: Option<String>,
+}
 
 /// The value used by the `OlmMachine` JS class.
 ///
@@ -205,7 +252,7 @@ impl OlmMachine {
         changed_devices: &sync_events::DeviceLists,
         one_time_key_counts: HashMap<String, u32>,
         unused_fallback_keys: Vec<String>,
-    ) -> napi::Result<String> {
+    ) -> napi::Result<ReceiveSyncChangesResult> {
         let to_device_events_decoded =
             serde_json::from_str(to_device_events.as_ref()).map_err(into_err)?;
         let changed_devices = changed_devices.inner.clone();
@@ -220,22 +267,30 @@ impl OlmMachine {
                 .collect::<Vec<_>>(),
         );
 
-        serde_json::to_string(
-            &self
-                .inner
-                .receive_sync_changes(EncryptionSyncChanges {
-                    to_device_events: to_device_events_decoded,
-                    changed_devices: &changed_devices,
-                    one_time_keys_counts: &one_time_key_counts,
-                    unused_fallback_keys: unused_fallback_keys.as_deref(),
+        let (events_raw, room_key_infos_raw) = self
+            .inner
+            .receive_sync_changes(EncryptionSyncChanges {
+                to_device_events: to_device_events_decoded,
+                changed_devices: &changed_devices,
+                one_time_keys_counts: &one_time_key_counts,
+                unused_fallback_keys: unused_fallback_keys.as_deref(),
+                next_batch_token: None,
+            })
+            .await
+            .map_err(into_err)?;
 
-                    // matrix-sdk-crypto does not (currently) use `next_batch_token`.
-                    next_batch_token: None,
-                })
-                .await
-                .map_err(into_err)?,
-        )
-        .map_err(into_err)
+        let events = serde_json::to_string(&events_raw).map_err(into_err)?;
+        let room_key_infos = room_key_infos_raw
+            .into_iter()
+            .map(|rki| RoomKeyInfoResult {
+                algorithm: rki.algorithm.to_string(),
+                room_id: rki.room_id.to_string(),
+                sender_key: rki.sender_key.to_base64(),
+                session_id: rki.session_id,
+            })
+            .collect();
+
+        Ok(ReceiveSyncChangesResult { events, room_key_infos })
     }
 
     /// Get the outgoing requests that need to be sent out.
@@ -640,6 +695,263 @@ impl OlmMachine {
     #[napi]
     pub async fn room_key_counts(&self) -> napi::Result<RoomKeyCounts> {
         Ok(self.inner.backup_machine().room_key_counts().await.map_err(into_err)?.into())
+    }
+
+    /// Import previously exported room keys into the crypto store.
+    ///
+    /// # Arguments
+    ///
+    /// * `exported_keys_json`, a JSON-encoded array of exported room keys.
+    #[napi(strict)]
+    pub async fn import_exported_room_keys(
+        &self,
+        exported_keys_json: String,
+    ) -> napi::Result<ImportRoomKeysResult> {
+        let keys: Vec<ExportedRoomKey> =
+            serde_json::from_str(&exported_keys_json).map_err(into_err)?;
+        let result =
+            self.inner.store().import_exported_room_keys(keys, |_, _| {}).await.map_err(into_err)?;
+
+        Ok(ImportRoomKeysResult {
+            imported_count: result.imported_count.try_into().unwrap_or(u32::MAX).into(),
+            total_count: result.total_count.try_into().unwrap_or(u32::MAX).into(),
+            keys: serde_json::to_string(&result.keys).map_err(into_err)?,
+        })
+    }
+
+    /// Export all room keys as a JSON-encoded string.
+    #[napi]
+    pub async fn export_room_keys(&self) -> napi::Result<String> {
+        serde_json::to_string(
+            &self.inner.store().export_room_keys(|_| true).await.map_err(into_err)?,
+        )
+        .map_err(into_err)
+    }
+
+    /// Mark all tracked users as dirty, triggering key re-queries
+    /// on the next sync.
+    #[napi]
+    pub async fn mark_all_tracked_users_as_dirty(&self) -> napi::Result<()> {
+        self.inner.mark_all_tracked_users_as_dirty().await.map_err(into_err)
+    }
+
+    /// Check if the room key for the given encrypted event is
+    /// available in the store.
+    ///
+    /// # Arguments
+    ///
+    /// * `event`, the JSON-encoded encrypted event.
+    /// * `room_id`, the room ID where the event was sent.
+    #[napi(strict)]
+    pub async fn is_room_key_available(
+        &self,
+        event: String,
+        room_id: &identifiers::RoomId,
+    ) -> napi::Result<bool> {
+        let event = Raw::from_json(RawValue::from_string(event).map_err(into_err)?);
+        let room_id = room_id.inner.clone();
+        self.inner.is_room_key_available(&event, &room_id).await.map_err(into_err)
+    }
+
+    /// Request a room key from other devices for the given encrypted event.
+    ///
+    /// Returns the outgoing requests that need to be sent (may include
+    /// a cancellation for a previous request).
+    ///
+    /// # Arguments
+    ///
+    /// * `event`, the JSON-encoded encrypted event.
+    /// * `room_id`, the room ID where the event was sent.
+    #[napi(strict)]
+    pub async fn request_room_key(
+        &self,
+        event: String,
+        room_id: &identifiers::RoomId,
+    ) -> napi::Result<
+        Vec<
+            Either6<
+                requests::KeysUploadRequest,
+                requests::KeysQueryRequest,
+                requests::KeysClaimRequest,
+                requests::ToDeviceRequest,
+                requests::SignatureUploadRequest,
+                requests::RoomMessageRequest,
+            >,
+        >,
+    > {
+        let event = Raw::from_json(RawValue::from_string(event).map_err(into_err)?);
+        let room_id = room_id.inner.clone();
+        let (cancellation, key_request) =
+            self.inner.request_room_key(&event, &room_id).await.map_err(into_err)?;
+
+        let mut results = Vec::new();
+        if let Some(cancel) = cancellation {
+            results.push(requests::OutgoingRequest(cancel).try_into()?);
+        }
+        results.push(requests::OutgoingRequest(key_request).try_into()?);
+        Ok(results)
+    }
+
+    /// Discard the currently active room key for the given room.
+    ///
+    /// Returns `true` if a room key was discarded, `false` if there
+    /// was no active room key.
+    #[napi(strict)]
+    pub async fn discard_room_key(
+        &self,
+        room_id: &identifiers::RoomId,
+    ) -> napi::Result<bool> {
+        let room_id = room_id.inner.clone();
+        self.inner.discard_room_key(&room_id).await.map_err(into_err)
+    }
+
+    /// Get a SAS verification object for the given user and flow ID.
+    ///
+    /// Returns `null` if no SAS verification exists for the given
+    /// identifiers, or if the verification is QR-based.
+    #[napi(strict)]
+    pub fn get_sas_verification(
+        &self,
+        user_id: &identifiers::UserId,
+        flow_id: String,
+    ) -> Option<verification::Sas> {
+        match self.inner.get_verification(user_id.inner.as_ref(), &flow_id) {
+            Some(InnerVerification::SasV1(sas)) => {
+                Some(verification::Sas { inner: sas })
+            }
+            _ => None,
+        }
+    }
+
+    /// Get a verification request for the given user and flow ID.
+    #[napi(strict)]
+    pub fn get_verification_request(
+        &self,
+        user_id: &identifiers::UserId,
+        flow_id: String,
+    ) -> Option<verification::VerificationRequest> {
+        self.inner
+            .get_verification_request(user_id.inner.as_ref(), &flow_id)
+            .map(|inner| verification::VerificationRequest { inner })
+    }
+
+    /// Get all verification requests for the given user.
+    #[napi(strict)]
+    pub fn get_verification_requests(
+        &self,
+        user_id: &identifiers::UserId,
+    ) -> Vec<verification::VerificationRequest> {
+        self.inner
+            .get_verification_requests(user_id.inner.as_ref())
+            .into_iter()
+            .map(|inner| verification::VerificationRequest { inner })
+            .collect()
+    }
+
+    /// Receive and process a verification event.
+    ///
+    /// # Arguments
+    ///
+    /// * `event`, the JSON-encoded verification event.
+    #[napi(strict)]
+    pub async fn receive_verification_event(&self, event: String) -> napi::Result<()> {
+        let event: AnyMessageLikeEvent =
+            serde_json::from_str(&event).map_err(into_err)?;
+        self.inner.receive_verification_event(&event).await.map_err(into_err)
+    }
+
+    /// Get a device by its user ID and device ID.
+    #[napi(strict)]
+    pub async fn get_device(
+        &self,
+        user_id: &identifiers::UserId,
+        device_id: &identifiers::DeviceId,
+    ) -> napi::Result<Option<device::Device>> {
+        let user_id = user_id.inner.clone();
+        let device_id = device_id.inner.clone();
+        let device =
+            self.inner.get_device(&user_id, &device_id, None).await.map_err(into_err)?;
+        Ok(device.map(|d| device::Device { inner: d }))
+    }
+
+    /// Get all devices for a user.
+    #[napi(strict)]
+    pub async fn get_user_devices(
+        &self,
+        user_id: &identifiers::UserId,
+    ) -> napi::Result<Vec<device::Device>> {
+        let user_id = user_id.inner.clone();
+        let devices = self.inner.get_user_devices(&user_id, None).await.map_err(into_err)?;
+        Ok(devices.devices().map(|d| device::Device { inner: d }).collect())
+    }
+
+    /// Get the user identity for the given user ID.
+    #[napi(strict)]
+    pub async fn get_identity(
+        &self,
+        user_id: &identifiers::UserId,
+    ) -> napi::Result<Option<device::UserIdentity>> {
+        let user_id = user_id.inner.clone();
+        let identity = self.inner.get_identity(&user_id, None).await.map_err(into_err)?;
+        Ok(identity.map(|i| device::UserIdentity { inner: i }))
+    }
+
+    /// Export the private cross-signing keys.
+    ///
+    /// Returns `null` if no cross-signing keys are available.
+    #[napi]
+    pub async fn export_cross_signing_keys(
+        &self,
+    ) -> napi::Result<Option<CrossSigningKeyExportResult>> {
+        match self.inner.export_cross_signing_keys().await.map_err(into_err)? {
+            Some(export) => Ok(Some(CrossSigningKeyExportResult {
+                master_key: export.master_key.clone(),
+                self_signing_key: export.self_signing_key.clone(),
+                user_signing_key: export.user_signing_key.clone(),
+            })),
+            None => Ok(None),
+        }
+    }
+
+    /// Import private cross-signing keys.
+    #[napi(strict)]
+    pub async fn import_cross_signing_keys(
+        &self,
+        master_key: Option<String>,
+        self_signing_key: Option<String>,
+        user_signing_key: Option<String>,
+    ) -> napi::Result<olm::CrossSigningStatus> {
+        let export = CrossSigningKeyExport { master_key, self_signing_key, user_signing_key };
+        Ok(self.inner.import_cross_signing_keys(export).await.map_err(into_err)?.into())
+    }
+
+    /// Generate a key query request for the given users.
+    ///
+    /// This creates an out-of-band key query request that can be
+    /// sent independently of sync.
+    #[napi(strict)]
+    pub fn query_keys_for_users(
+        &self,
+        users: Vec<&identifiers::UserId>,
+    ) -> napi::Result<requests::KeysQueryRequest> {
+        let users = users.into_iter().map(|user| user.inner.clone()).collect::<Vec<_>>();
+        let (txn_id, request) =
+            self.inner.query_keys_for_users(users.iter().map(AsRef::as_ref));
+        requests::KeysQueryRequest::try_from((txn_id.to_string(), &request))
+    }
+
+    /// Get the display name of this device.
+    #[napi]
+    pub async fn display_name(&self) -> napi::Result<Option<String>> {
+        self.inner.display_name().await.map_err(into_err)
+    }
+
+    /// Get the device creation timestamp in milliseconds since
+    /// the Unix epoch.
+    #[napi(getter)]
+    pub fn device_creation_time(&self) -> f64 {
+        let ts = self.inner.device_creation_time();
+        u64::from(ts.0) as f64
     }
 
     /// Shut down the `OlmMachine`.
